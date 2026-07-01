@@ -138,12 +138,13 @@ def call_lemma_agent(title: str, description: str) -> dict:
         raise RuntimeError("Agent did not return valid JSON")
 
 
-def save_to_issues_table(triage: dict, raw_input: str, source: str):
+def save_to_issues_table(triage: dict, raw_input: str, source: str,
+                          github_repo: str = "", github_issue: str = ""):
     similar = triage.get("similar_issues", [])
     similar = json.dumps(similar) if isinstance(similar, list) and similar else ""
     with httpx.Client(timeout=30) as c:
         h = headers()
-        payload = {"data": {
+        data = {
             "title": triage.get("title", raw_input[:80]),
             "raw_input": raw_input, "source": source,
             "priority": triage.get("priority", "P3"),
@@ -155,9 +156,26 @@ def save_to_issues_table(triage: dict, raw_input: str, source: str):
             "similar_issues": similar,
             "confidence": str(triage.get("confidence", "")),
             "conversation_id": triage.get("conversation_id", ""),
-        }}
+            "github_repo": github_repo,
+            "github_issue": github_issue,
+        }
+        # Check for existing record with same repo + issue
+        if github_repo and github_issue:
+            q = f"github_repo='{github_repo}' and github_issue='{github_issue}'"
+            existing = c.get(
+                f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/datastore/tables/issues/records?query={q}",
+                headers=h, timeout=15)
+            if existing.status_code == 200:
+                existing_items = existing.json().get("items", [])
+                if existing_items:
+                    rid = existing_items[0].get("id")
+                    r = c.patch(
+                        f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/datastore/tables/issues/records/{rid}",
+                        headers=h, json={"data": data}, timeout=15)
+                    logger.info(f"Updated existing record {rid}")
+                    return
         r = c.post(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/datastore/tables/issues/records",
-                    headers=h, json=payload)
+                    headers=h, json={"data": data}, timeout=15)
         if r.status_code not in (200, 201):
             logger.error(f"Save error: {r.status_code} {r.text[:200]}")
 
@@ -170,6 +188,15 @@ def post_github_comment(repo_full_name: str, issue_number: int, triage: dict):
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(repo_full_name)
         issue = repo.get_issue(issue_number)
+
+        # Check if bot already commented
+        comments = issue.get_comments()
+        bot_user = g.get_user().login
+        for c in comments:
+            if c.user.login == bot_user and "Bug Triage Report" in c.body:
+                logger.info(f"Comment already exists on {repo_full_name}#{issue_number}, skipping")
+                return
+
         body = (
             f"### Bug Triage Report\n\n"
             f"**Priority:** {triage.get('priority', 'N/A')}\n"
@@ -192,8 +219,9 @@ async def process_issue(repo_full: str, issue_num: int, title: str, body: str):
             executor, call_lemma_agent, title, body)
         logger.info(f"Triage done: P={triage.get('priority')}")
         await asyncio.get_event_loop().run_in_executor(
-            executor, save_to_issues_table, triage,
-            f"Title: {title}\nDescription: {body}", "github")
+            executor, save_to_issues_table,
+            triage, f"Title: {title}\nDescription: {body}", "github",
+            repo_full, str(issue_num))
         await asyncio.get_event_loop().run_in_executor(
             executor, post_github_comment, repo_full, issue_num, triage)
         logger.info(f"Done processing {repo_full}#{issue_num}")

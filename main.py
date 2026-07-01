@@ -20,12 +20,46 @@ app = FastAPI(title="Bug Triage GitHub Webhook Receiver")
 
 LEMMA_API_URL = os.getenv("LEMMA_API_URL", "https://api.lemma.work")
 LEMMA_POD_ID = os.getenv("LEMMA_POD_ID")
-LEMMA_TOKEN = os.getenv("LEMMA_TOKEN")
+LEMMA_REFRESH_TOKEN = os.getenv("LEMMA_REFRESH_TOKEN", "")
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "").encode()
 
-HEADERS = {"Authorization": f"Bearer {LEMMA_TOKEN}", "Content-Type": "application/json"}
 executor = ThreadPoolExecutor(max_workers=4)
+
+_current_token = os.getenv("LEMMA_TOKEN", "")
+
+
+def refresh_lemma_token():
+    global _current_token
+    if not LEMMA_REFRESH_TOKEN:
+        logger.warning("No LEMMA_REFRESH_TOKEN set - using LEMMA_TOKEN as-is")
+        return _current_token
+    try:
+        r = httpx.post(
+            f"{LEMMA_API_URL}/auth/cli/refresh",
+            json={"refresh_token": LEMMA_REFRESH_TOKEN},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error(f"Token refresh failed: {r.status_code} {r.text[:200]}")
+            return _current_token
+        data = r.json()
+        _current_token = data.get("access_token", data.get("token", _current_token))
+        logger.info("Token refreshed successfully")
+    except Exception as e:
+        logger.error(f"Token refresh error: {e}")
+    return _current_token
+
+
+def get_token():
+    if not _current_token:
+        refresh_lemma_token()
+    return _current_token
+
+
+def headers():
+    return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
 
 
 def verify_signature(payload: bytes, signature_header: str | None) -> bool:
@@ -40,14 +74,21 @@ def verify_signature(payload: bytes, signature_header: str | None) -> bool:
 def call_lemma_agent(title: str, description: str) -> dict:
     msg_text = f"Title: {title}\nDescription: {description}"
     with httpx.Client(timeout=120) as c:
+        h = headers()
         r1 = c.post(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations",
-                     headers=HEADERS, json={"agent_name": "bug_triage_agent"})
+                     headers=h, json={"agent_name": "bug_triage_agent"})
+        if r1.status_code == 401:
+            logger.info("Token expired, refreshing...")
+            refresh_lemma_token()
+            h = headers()
+            r1 = c.post(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations",
+                         headers=h, json={"agent_name": "bug_triage_agent"})
         conv_id = r1.json().get("id")
         logger.info(f"Conversation: {conv_id}")
 
         agent_run_id = None
         with c.stream("POST", f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages",
-                       headers=HEADERS, json={"content": msg_text}) as resp:
+                       headers=h, json={"content": msg_text}) as resp:
             buf = []
             for line in resp.iter_lines():
                 line = line.strip()
@@ -68,17 +109,15 @@ def call_lemma_agent(title: str, description: str) -> dict:
         if not agent_run_id:
             raise RuntimeError("No agent_run_id")
 
-        # Stream to wait for completion
         with c.stream("GET", f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/stream?agent_run_id={agent_run_id}",
-                       headers=HEADERS) as resp:
+                       headers=h) as resp:
             for line in resp.iter_lines():
                 pass
 
-        # Poll messages for assistant content
         time.sleep(3)
         for attempt in range(10):
             r3 = c.get(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages?limit=20",
-                        headers=HEADERS)
+                        headers=h)
             items = r3.json().get("items", [])
             for m in reversed(items):
                 role = m.get("role")
@@ -103,6 +142,7 @@ def save_to_issues_table(triage: dict, raw_input: str, source: str):
     similar = triage.get("similar_issues", [])
     similar = json.dumps(similar) if isinstance(similar, list) and similar else ""
     with httpx.Client(timeout=30) as c:
+        h = headers()
         payload = {"data": {
             "title": triage.get("title", raw_input[:80]),
             "raw_input": raw_input, "source": source,
@@ -117,7 +157,7 @@ def save_to_issues_table(triage: dict, raw_input: str, source: str):
             "conversation_id": triage.get("conversation_id", ""),
         }}
         r = c.post(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/datastore/tables/issues/records",
-                    headers=HEADERS, json=payload)
+                    headers=h, json=payload)
         if r.status_code not in (200, 201):
             logger.error(f"Save error: {r.status_code} {r.text[:200]}")
 
@@ -130,8 +170,6 @@ def post_github_comment(repo_full_name: str, issue_number: int, triage: dict):
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(repo_full_name)
         issue = repo.get_issue(issue_number)
-        similar = triage.get("similar_issues", [])
-        similar_text = json.dumps(similar, indent=2) if similar else "None"
         body = (
             f"### Bug Triage Report\n\n"
             f"**Priority:** {triage.get('priority', 'N/A')}\n"
@@ -206,5 +244,6 @@ async def github_webhook(request: Request):
 
 
 if __name__ == "__main__":
+    refresh_lemma_token()
     import uvicorn
     uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))

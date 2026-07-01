@@ -84,7 +84,10 @@ def call_lemma_agent(title: str, description: str) -> dict:
                 role = m.get("role")
                 content = m.get("content", m.get("text", ""))
                 if role == "assistant" and content:
-                    clean = re.sub(r"```json\n?|```\n?", "", content).strip()
+                    match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
+                    if not match:
+                        match = re.search(r"(\{.*\})", content, re.DOTALL)
+                    clean = match.group(1) if match else content.strip()
                     try:
                         parsed = json.loads(clean)
                         parsed["conversation_id"] = str(conv_id)

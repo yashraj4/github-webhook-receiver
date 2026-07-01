@@ -3,7 +3,6 @@ import hmac
 import json
 import os
 import logging
-import asyncio
 
 import httpx
 from dotenv import load_dotenv
@@ -35,10 +34,37 @@ def verify_signature(payload: bytes, signature_header: str | None) -> bool:
     return hmac.compare_digest(expected, signature_header)
 
 
+def parse_sse_events(response: httpx.Response) -> list[dict]:
+    events = []
+    data_lines = []
+    for line in response.iter_lines():
+        line = line.strip()
+        if line == "":
+            if data_lines:
+                raw = "".join(data_lines)
+                data_lines = []
+                if raw:
+                    try:
+                        events.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        pass
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:
+        raw = "".join(data_lines)
+        if raw:
+            try:
+                events.append(json.loads(raw))
+            except json.JSONDecodeError:
+                pass
+    return events
+
+
 async def call_lemma_agent(title: str, description: str) -> dict:
     message_text = f"Title: {title}\nDescription: {description}"
 
     async with httpx.AsyncClient(timeout=120) as client:
+        # Create conversation
         r1 = await client.post(
             f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations",
             headers=HEADERS,
@@ -50,34 +76,50 @@ async def call_lemma_agent(title: str, description: str) -> dict:
         if not conv_id:
             raise RuntimeError("No conversation id")
 
-        r2 = await client.post(
+        # Send message and stream SSE response
+        async with client.stream(
+            "POST",
             f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages",
             headers=HEADERS,
             json={"content": message_text},
-        )
-        logger.info(f"Send message: {r2.status_code}")
-        if r2.status_code not in (200, 201):
-            raise RuntimeError(f"Send message failed: {r2.status_code} {r2.text}")
+        ) as resp:
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(f"Send message failed: {resp.status_code}")
 
-        for attempt in range(15):
-            await asyncio.sleep(2)
-            r3 = await client.get(
-                f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages",
-                headers=HEADERS,
-            )
-            if r3.status_code == 200:
-                msgs = r3.json().get("items", [])
-                for m in reversed(msgs):
-                    if m.get("role") == "assistant":
-                        content = m.get("content", "").strip()
-                        if content:
-                            try:
-                                parsed = json.loads(content)
-                                parsed["conversation_id"] = str(conv_id)
-                                return parsed
-                            except (json.JSONDecodeError, TypeError):
-                                return {"raw": content, "conversation_id": str(conv_id)}
-        raise RuntimeError("Agent did not respond within timeout")
+            # Read SSE events in real-time
+            assistant_content = None
+            data_lines = []
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if line == "" and data_lines:
+                    raw = "".join(data_lines)
+                    data_lines = []
+                    if raw:
+                        try:
+                            event = json.loads(raw)
+                            ev_type = event.get("type", "")
+                            ev_data = event.get("data", {})
+                            if ev_type == "message" and isinstance(ev_data, dict):
+                                if ev_data.get("role") == "assistant":
+                                    content = ev_data.get("content", "")
+                                    if content:
+                                        assistant_content = content
+                            elif ev_type == "completed":
+                                break
+                        except json.JSONDecodeError:
+                            pass
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+
+        if assistant_content:
+            try:
+                parsed = json.loads(assistant_content)
+                parsed["conversation_id"] = str(conv_id)
+                return parsed
+            except (json.JSONDecodeError, TypeError):
+                return {"raw": assistant_content, "conversation_id": str(conv_id)}
+
+        raise RuntimeError("Agent did not respond")
 
 
 async def save_to_issues_table(triage: dict, raw_input: str, source: str):
@@ -116,24 +158,26 @@ def post_github_comment(repo_full_name: str, issue_number: int, triage: dict):
     if not GITHUB_TOKEN:
         logger.warning("No GITHUB_TOKEN set -- skipping comment")
         return
-    g = Github(GITHUB_TOKEN)
-    repo = g.get_repo(repo_full_name)
-    issue = repo.get_issue(issue_number)
-
-    similar = triage.get("similar_issues", [])
-    similar_text = json.dumps(similar, indent=2) if similar else "None"
-    body = (
-        f"### Bug Triage Report\n\n"
-        f"**Priority:** {triage.get('priority', 'N/A')}\n"
-        f"**Affected Area:** {triage.get('affected_area', 'N/A')}\n"
-        f"**Confidence:** {triage.get('confidence', 'N/A')}\n\n"
-        f"**Rationale:**\n{triage.get('priority_rationale', 'N/A')}\n\n"
-        f"**Steps to Reproduce:**\n{triage.get('steps_to_reproduce', 'N/A')}\n\n"
-        f"**Duplicate of:** {triage.get('duplicate_of', 'None')}\n"
-        f"**Similar issues:** {similar_text}\n"
-    )
-    issue.create_comment(body)
-    logger.info(f"Comment posted on {repo_full}#{issue_number}")
+    try:
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(repo_full_name)
+        issue = repo.get_issue(issue_number)
+        similar = triage.get("similar_issues", [])
+        similar_text = json.dumps(similar, indent=2) if similar else "None"
+        body = (
+            f"### Bug Triage Report\n\n"
+            f"**Priority:** {triage.get('priority', 'N/A')}\n"
+            f"**Affected Area:** {triage.get('affected_area', 'N/A')}\n"
+            f"**Confidence:** {triage.get('confidence', 'N/A')}\n\n"
+            f"**Rationale:**\n{triage.get('priority_rationale', 'N/A')}\n\n"
+            f"**Steps to Reproduce:**\n{triage.get('steps_to_reproduce', 'N/A')}\n\n"
+            f"**Duplicate of:** {triage.get('duplicate_of', 'None')}\n"
+            f"**Similar issues:** {similar_text}\n"
+        )
+        issue.create_comment(body)
+        logger.info(f"Comment posted on {repo_full_name}#{issue_number}")
+    except Exception as e:
+        logger.error(f"GitHub comment failed: {e}")
 
 
 @app.get("/")

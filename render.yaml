@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: bug-triage-github-webhook
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LEMMA_API_URL
+        value: https://api.lemma.work
+      - key: LEMMA_ORG_ID
+        value: 019efdc1-2a62-7376-97c7-3a00e121f984
+      - key: LEMMA_POD_ID
+        value: 019f19c6-815b-74ba-aaee-fb815696f3b0
+      - key: LEMMA_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false

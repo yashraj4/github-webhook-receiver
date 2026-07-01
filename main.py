@@ -184,10 +184,11 @@ def post_github_comment(repo_full_name: str, issue_number: int, triage: dict):
     logger.info(f"Posted comment on {repo_full_name}#{issue_number}")
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "bug-triage-github-webhook"}
-
+# Add this right before the POST handler:
+@app.get("/webhook/github")
+async def github_webhook_verify():
+    return {"status": "ok", "message": "GitHub webhook endpoint ready"}
+    
 
 @app.post("/webhook/github")
 async def github_webhook(request: Request):
@@ -198,6 +199,10 @@ async def github_webhook(request: Request):
         raise HTTPException(401, "Invalid signature")
 
     event = request.headers.get("x-github-event", "")
+
+    if event == "ping":
+        return {"status": "pong", "event": "ping"}
+        
     if event not in ("issues", "issue_comment"):
         return {"status": "ignored", "event": event}
 

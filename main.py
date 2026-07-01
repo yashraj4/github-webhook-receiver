@@ -4,6 +4,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
@@ -41,6 +43,8 @@ def call_lemma_agent(title: str, description: str) -> dict:
         r1 = c.post(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations",
                      headers=HEADERS, json={"agent_name": "bug_triage_agent"})
         conv_id = r1.json().get("id")
+        logger.info(f"Conversation: {conv_id}")
+
         agent_run_id = None
         with c.stream("POST", f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages",
                        headers=HEADERS, json={"content": msg_text}) as resp:
@@ -60,39 +64,36 @@ def call_lemma_agent(title: str, description: str) -> dict:
                         pass
                 elif line.startswith("data:"):
                     buf.append(line[5:].lstrip())
+
         if not agent_run_id:
             raise RuntimeError("No agent_run_id")
-        result = None
+
+        # Stream to wait for completion
         with c.stream("GET", f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/stream?agent_run_id={agent_run_id}",
                        headers=HEADERS) as resp:
-            buf = []
             for line in resp.iter_lines():
-                line = line.strip()
-                if line == "" and buf:
-                    raw = "".join(buf)
-                    buf = []
+                pass
+
+        # Poll messages for assistant content
+        time.sleep(3)
+        for attempt in range(10):
+            r3 = c.get(f"{LEMMA_API_URL}/pods/{LEMMA_POD_ID}/conversations/{conv_id}/messages?limit=20",
+                        headers=HEADERS)
+            items = r3.json().get("items", [])
+            for m in reversed(items):
+                role = m.get("role")
+                content = m.get("content", m.get("text", ""))
+                if role == "assistant" and content:
+                    clean = re.sub(r"```json\n?|```\n?", "", content).strip()
                     try:
-                        ev = json.loads(raw)
-                        if ev.get("type") == "message":
-                            ed = ev.get("data", {})
-                            if isinstance(ed, dict) and ed.get("role") == "assistant":
-                                content = ed.get("content", "").strip()
-                                if content:
-                                    result = content
-                        elif ev.get("type") == "completed":
-                            break
-                    except json.JSONDecodeError:
-                        pass
-                elif line.startswith("data:"):
-                    buf.append(line[5:].lstrip())
-        if result:
-            try:
-                parsed = json.loads(result)
-                parsed["conversation_id"] = str(conv_id)
-                return parsed
-            except (json.JSONDecodeError, TypeError):
-                return {"raw": result, "conversation_id": str(conv_id)}
-        raise RuntimeError("Agent did not return content")
+                        parsed = json.loads(clean)
+                        parsed["conversation_id"] = str(conv_id)
+                        return parsed
+                    except (json.JSONDecodeError, TypeError):
+                        logger.info(f"Assistant content not JSON: {content[:100]}")
+            time.sleep(3)
+
+        raise RuntimeError("Agent did not return valid JSON")
 
 
 def save_to_issues_table(triage: dict, raw_input: str, source: str):
@@ -126,6 +127,8 @@ def post_github_comment(repo_full_name: str, issue_number: int, triage: dict):
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(repo_full_name)
         issue = repo.get_issue(issue_number)
+        similar = triage.get("similar_issues", [])
+        similar_text = json.dumps(similar, indent=2) if similar else "None"
         body = (
             f"### Bug Triage Report\n\n"
             f"**Priority:** {triage.get('priority', 'N/A')}\n"
@@ -194,7 +197,6 @@ async def github_webhook(request: Request):
 
     logger.info(f"Webhook received: {repo_full}#{issue_num} - {title}")
 
-    # Acknowledge immediately to avoid GitHub timeout
     asyncio.ensure_future(process_issue(repo_full, issue_num, title, description))
 
     return {"status": "accepted", "message": "Processing in background"}

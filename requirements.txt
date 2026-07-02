@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 pygithub==2.5.0
 python-dotenv==1.0.1
+lemma-sdk>=0.5.3

@@ -59,7 +59,11 @@ def get_token():
 
 
 def headers():
-    return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
+    token = get_token()
+    if not token:
+        logger.error("No valid token available - cannot make API call")
+        return {}
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
 def verify_signature(payload: bytes, signature_header: str | None) -> bool:
